@@ -3827,114 +3827,6 @@ uint8_t GW_Catm1_CopyTimeSyncDeltaBuf(int64_t* out_buf, uint8_t max_items)
     return cnt;
 }
 
-bool GW_Catm1_SyncTimeOnce(void)
-{
-    bool success = false;
-    uint32_t attempt = 0u;
-
-    if (GW_Catm1_IsBusy()) {
-        return false;
-    }
-
-    s_catm1_boot_time_sync_strict_order_active = true;
-    /* MCU가 다시 부팅된 경우라도 boot one-shot sync에서는
-     * 첫 세팅을 무조건 APN bootstrap으로 다시 보장한다. */
-    s_catm1_startup_apn_configured_this_power = false;
-    s_catm1_pending_psuttz_valid = false;
-    s_catm1_pending_psuttz_epoch_centi = 0u;
-
-    UI_LPM_LockStop();
-    GW_Catm1_SetBusy(true);
-    if (!prv_lpuart_ensure()) {
-        goto cleanup;
-    }
-
-    for (attempt = 0u; attempt < GW_CATM1_STARTUP_SYNC_ATTEMPTS; attempt++) {
-        prv_begin_sms_ready_loop_attempt();
-
-        if ((attempt > 0u) && !prv_was_powered_off_recently(GW_CATM1_RECENT_POWEROFF_SKIP_MS)) {
-            prv_force_power_cut();
-        }
-
-        if (!prv_start_session(false)) {
-            prv_finish_sms_ready_loop_attempt(false);
-            if (s_catm1_sms_ready_loop_attempt_count >= GW_CATM1_SMS_READY_LOOP_STOP_TRY) {
-                break;
-            }
-            continue;
-        }
-
-        success = prv_startup_time_sync_user_sequence();
-        prv_finish_sms_ready_loop_attempt(success);
-        if (success || (s_catm1_sms_ready_loop_attempt_count >= GW_CATM1_SMS_READY_LOOP_STOP_TRY)) {
-            break;
-        }
-    }
-
-cleanup:
-    prv_delay_ms(GW_CATM1_POST_TIME_SYNC_POWER_CUT_GUARD_MS);
-    if (!prv_was_powered_off_recently(GW_CATM1_RECENT_POWEROFF_SKIP_MS)) {
-        prv_shutdown_modem_prefer_poweroff();
-    }
-    prv_lpuart_release();
-    GW_Catm1_SetBusy(false);
-    UI_LPM_UnlockStop();
-    s_catm1_boot_time_sync_strict_order_active = false;
-
-    return success;
-}
-
-bool GW_Catm1_QueryAndStoreLoc(char* out_line, size_t out_sz)
-{
-    char loc_line[GW_LOC_LINE_MAX];
-    GW_LocRec_t loc_rec;
-    bool success = false;
-
-    if (GW_Catm1_IsBusy()) {
-        return false;
-    }
-    if ((out_line != NULL) && (out_sz > 0u)) {
-        out_line[0] = '\0';
-    }
-
-    UI_LPM_LockStop();
-    GW_Catm1_SetBusy(true);
-    if (!prv_lpuart_ensure()) {
-        goto cleanup;
-    }
-    prv_begin_sms_ready_loop_attempt();
-    if (!prv_start_session(true)) {
-        prv_finish_sms_ready_loop_attempt(false);
-        goto cleanup;
-    }
-    if (prv_wait_eps_registered() && prv_wait_ps_attached()) {
-        (void)prv_sync_time_from_modem_startup_try(true, false, NULL);
-    }
-    if (!prv_query_gnss_loc_line(loc_line, sizeof(loc_line))) {
-        goto cleanup;
-    }
-
-    memset(&loc_rec, 0, sizeof(loc_rec));
-    loc_rec.saved_epoch_sec = UI_Time_NowSec2016();
-    (void)snprintf(loc_rec.line, sizeof(loc_rec.line), "%s", loc_line);
-    if (!GW_Storage_SaveLocRec(&loc_rec)) {
-        goto cleanup;
-    }
-    if ((out_line != NULL) && (out_sz > 0u)) {
-        (void)snprintf(out_line, out_sz, "%s", loc_rec.line);
-    }
-    success = true;
-
-cleanup:
-    prv_finish_sms_ready_loop_attempt(success);
-    if (!prv_was_powered_off_recently(GW_CATM1_RECENT_POWEROFF_SKIP_MS)) {
-        GW_Catm1_PowerOff();
-    }
-    prv_lpuart_release();
-    GW_Catm1_SetBusy(false);
-    UI_LPM_UnlockStop();
-    return success;
-}
 
 static void prv_note_failed_snapshot_sent(void)
 {
@@ -4011,171 +3903,653 @@ static bool prv_store_failed_snapshot_to_flash(const GW_HourRec_t* rec)
     return false;
 }
 
-bool GW_Catm1_SendSnapshot(const GW_HourRec_t* rec)
+typedef void (*GW_Catm1StepFunc_t)(void);
+
+typedef struct
 {
+    GW_Catm1JobType_t  job_type;
+    GW_Catm1JobState_t job_state;
+    GW_Catm1StepFunc_t func;
+
+    uint32_t attempt;
+    uint32_t attempt_max;
+    bool     sms_ready_attempt_active;
+
+    bool     tcp_opened;
+    bool     live_rec_valid;
+    bool     should_store_live_fail;
+    uint32_t first_rec_index;
+    uint32_t max_count;
+    uint32_t sent_count;
+
+    GW_HourRec_t live_rec;
+    char         loc_line[GW_LOC_LINE_MAX];
+    char*        out_line;
+    size_t       out_line_sz;
+
     uint8_t ip[4];
     uint16_t port;
     char payload[UI_CATM1_SERVER_PAYLOAD_MAX + 1u];
     char rsp[UI_CATM1_RX_BUF_SZ];
-    bool success = false;
-    bool opened = false;
-    bool pdp_active = false;
-    bool should_store_on_fail = false;
-    size_t len;
-    GW_HourRec_t live_rec;
+} GW_Catm1AsyncCtx_t;
 
+static GW_Catm1AsyncCtx_t s_catm1_async = {0};
+
+static void prv_catm1_idle(void);
+static void prv_catm1_init(void);
+static void prv_catm1_time_sync_begin(void);
+static void prv_catm1_time_sync_start_session(void);
+static void prv_catm1_time_sync_run_user_sequence(void);
+static void prv_catm1_loc_begin(void);
+static void prv_catm1_loc_start_session(void);
+static void prv_catm1_loc_sync_time_and_query(void);
+static void prv_catm1_snapshot_prepare(void);
+static void prv_catm1_snapshot_start_session(void);
+static void prv_catm1_snapshot_prepare_tcp(void);
+static void prv_catm1_snapshot_open_tcp(void);
+static void prv_catm1_snapshot_send_payload(void);
+static void prv_catm1_stored_prepare(void);
+static void prv_catm1_stored_start_session(void);
+static void prv_catm1_stored_prepare_tcp(void);
+static void prv_catm1_stored_open_tcp(void);
+static void prv_catm1_stored_send_next(void);
+
+static void prv_catm1_set_func(GW_Catm1StepFunc_t func)
+{
+    s_catm1_async.func = (func != NULL) ? func : prv_catm1_idle;
+}
+
+static void prv_catm1_reset_async(void)
+{
+    memset(&s_catm1_async, 0, sizeof(s_catm1_async));
+    s_catm1_async.job_type = GW_CATM1_JOB_NONE;
+    s_catm1_async.job_state = GW_CATM1_JOB_STATE_IDLE;
+    s_catm1_async.func = prv_catm1_idle;
+}
+
+static void prv_catm1_finish_sms_attempt_if_needed(bool success)
+{
+    if (!s_catm1_async.sms_ready_attempt_active) {
+        return;
+    }
+
+    prv_finish_sms_ready_loop_attempt(success);
+    s_catm1_async.sms_ready_attempt_active = false;
+}
+
+static void prv_catm1_complete(bool success)
+{
+    GW_Catm1JobType_t finished_job = s_catm1_async.job_type;
+
+    prv_catm1_finish_sms_attempt_if_needed(success);
+
+    if ((finished_job == GW_CATM1_JOB_SNAPSHOT) ||
+        (finished_job == GW_CATM1_JOB_STORED_RANGE)) {
+        prv_consume_deferred_tcp_session_time_sync();
+    }
+    s_catm1_tcp_send_session_active = false;
+
+    if (finished_job == GW_CATM1_JOB_TIME_SYNC) {
+        prv_delay_ms(GW_CATM1_POST_TIME_SYNC_POWER_CUT_GUARD_MS);
+        if (!prv_was_powered_off_recently(GW_CATM1_RECENT_POWEROFF_SKIP_MS)) {
+            prv_shutdown_modem_prefer_poweroff();
+        }
+        s_catm1_boot_time_sync_strict_order_active = false;
+    } else if ((finished_job == GW_CATM1_JOB_SNAPSHOT) ||
+               (finished_job == GW_CATM1_JOB_STORED_RANGE)) {
+        prv_close_tcp_and_force_power_cut(s_catm1_async.tcp_opened,
+                                         s_catm1_async.rsp,
+                                         sizeof(s_catm1_async.rsp));
+    } else if (finished_job == GW_CATM1_JOB_QUERY_LOC) {
+        if (!prv_was_powered_off_recently(GW_CATM1_RECENT_POWEROFF_SKIP_MS)) {
+            GW_Catm1_PowerOff();
+        }
+    }
+
+    prv_lpuart_release();
+    GW_Catm1_SetBusy(false);
+    UI_LPM_UnlockStop();
+
+    if ((!success) &&
+        (finished_job == GW_CATM1_JOB_SNAPSHOT) &&
+        s_catm1_async.should_store_live_fail &&
+        s_catm1_async.live_rec_valid &&
+        GW_App_IsTcpEnabled()) {
+        (void)prv_store_failed_snapshot_to_flash(&s_catm1_async.live_rec);
+    }
+
+    s_catm1_async.job_state = success ? GW_CATM1_JOB_STATE_DONE_OK
+                                      : GW_CATM1_JOB_STATE_DONE_FAIL;
+    s_catm1_async.job_type = finished_job;
+    s_catm1_async.func = prv_catm1_idle;
+}
+
+static bool prv_catm1_request_begin(GW_Catm1JobType_t job_type)
+{
+    if (s_catm1_async.job_state != GW_CATM1_JOB_STATE_IDLE) {
+        return false;
+    }
+
+    prv_catm1_reset_async();
+    s_catm1_async.job_type = job_type;
+    s_catm1_async.job_state = GW_CATM1_JOB_STATE_BUSY;
+    prv_catm1_set_func(prv_catm1_init);
+    return true;
+}
+
+static bool prv_catm1_request_query_loc(char* out_line, size_t out_sz)
+{
+    if (!prv_catm1_request_begin(GW_CATM1_JOB_QUERY_LOC)) {
+        return false;
+    }
+
+    s_catm1_async.out_line = out_line;
+    s_catm1_async.out_line_sz = out_sz;
+    if ((out_line != NULL) && (out_sz > 0u)) {
+        out_line[0] = '\0';
+    }
+    return true;
+}
+
+static void prv_catm1_idle(void)
+{
+}
+
+static void prv_catm1_init(void)
+{
+    UI_LPM_LockStop();
+    GW_Catm1_SetBusy(true);
+
+    if (!prv_lpuart_ensure()) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    s_catm1_async.rsp[0] = '\0';
+    s_catm1_async.tcp_opened = false;
+    s_catm1_async.sent_count = 0u;
+
+    switch (s_catm1_async.job_type) {
+        case GW_CATM1_JOB_TIME_SYNC:
+            if (s_catm1_async.attempt_max == 0u) {
+                s_catm1_async.attempt_max = GW_CATM1_STARTUP_SYNC_ATTEMPTS;
+            }
+            s_catm1_boot_time_sync_strict_order_active = true;
+            s_catm1_startup_apn_configured_this_power = false;
+            s_catm1_pending_psuttz_valid = false;
+            s_catm1_pending_psuttz_epoch_centi = 0u;
+            prv_catm1_set_func(prv_catm1_time_sync_begin);
+            break;
+
+        case GW_CATM1_JOB_QUERY_LOC:
+            prv_catm1_set_func(prv_catm1_loc_begin);
+            break;
+
+        case GW_CATM1_JOB_SNAPSHOT:
+            prv_catm1_set_func(prv_catm1_snapshot_prepare);
+            break;
+
+        case GW_CATM1_JOB_STORED_RANGE:
+            prv_catm1_set_func(prv_catm1_stored_prepare);
+            break;
+
+        default:
+            prv_catm1_complete(false);
+            break;
+    }
+}
+
+static void prv_catm1_time_sync_begin(void)
+{
+    if (s_catm1_async.attempt >= s_catm1_async.attempt_max) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    prv_begin_sms_ready_loop_attempt();
+    s_catm1_async.sms_ready_attempt_active = true;
+
+    if ((s_catm1_async.attempt > 0u) &&
+        !prv_was_powered_off_recently(GW_CATM1_RECENT_POWEROFF_SKIP_MS)) {
+        prv_force_power_cut();
+    }
+
+    s_catm1_async.attempt++;
+    prv_catm1_set_func(prv_catm1_time_sync_start_session);
+}
+
+static void prv_catm1_time_sync_start_session(void)
+{
+    if (!prv_start_session(false)) {
+        prv_catm1_finish_sms_attempt_if_needed(false);
+        if ((s_catm1_sms_ready_loop_attempt_count >= GW_CATM1_SMS_READY_LOOP_STOP_TRY) ||
+            (s_catm1_async.attempt >= s_catm1_async.attempt_max)) {
+            prv_catm1_complete(false);
+        } else {
+            prv_catm1_set_func(prv_catm1_time_sync_begin);
+        }
+        return;
+    }
+
+    prv_catm1_set_func(prv_catm1_time_sync_run_user_sequence);
+}
+
+static void prv_catm1_time_sync_run_user_sequence(void)
+{
+    bool success = prv_startup_time_sync_user_sequence();
+
+    prv_catm1_finish_sms_attempt_if_needed(success);
+
+    if (success) {
+        prv_catm1_complete(true);
+        return;
+    }
+
+    if ((s_catm1_sms_ready_loop_attempt_count >= GW_CATM1_SMS_READY_LOOP_STOP_TRY) ||
+        (s_catm1_async.attempt >= s_catm1_async.attempt_max)) {
+        prv_catm1_complete(false);
+    } else {
+        prv_catm1_set_func(prv_catm1_time_sync_begin);
+    }
+}
+
+static void prv_catm1_loc_begin(void)
+{
+    prv_begin_sms_ready_loop_attempt();
+    s_catm1_async.sms_ready_attempt_active = true;
+    prv_catm1_set_func(prv_catm1_loc_start_session);
+}
+
+static void prv_catm1_loc_start_session(void)
+{
+    if (!prv_start_session(true)) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    prv_catm1_set_func(prv_catm1_loc_sync_time_and_query);
+}
+
+static void prv_catm1_loc_sync_time_and_query(void)
+{
+    GW_LocRec_t loc_rec;
+
+    if (prv_wait_eps_registered() && prv_wait_ps_attached()) {
+        (void)prv_sync_time_from_modem_startup_try(true, false, NULL);
+    }
+
+    if (!prv_query_gnss_loc_line(s_catm1_async.loc_line, sizeof(s_catm1_async.loc_line))) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    memset(&loc_rec, 0, sizeof(loc_rec));
+    loc_rec.saved_epoch_sec = UI_Time_NowSec2016();
+    (void)snprintf(loc_rec.line, sizeof(loc_rec.line), "%s", s_catm1_async.loc_line);
+    if (!GW_Storage_SaveLocRec(&loc_rec)) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    if ((s_catm1_async.out_line != NULL) && (s_catm1_async.out_line_sz > 0u)) {
+        (void)snprintf(s_catm1_async.out_line,
+                       s_catm1_async.out_line_sz,
+                       "%s",
+                       loc_rec.line);
+    }
+
+    prv_catm1_complete(true);
+}
+
+static void prv_catm1_snapshot_prepare(void)
+{
+    size_t len;
+
+    if ((!GW_App_IsTcpEnabled()) || !s_catm1_async.live_rec_valid) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    if (prv_tcp_blocked_by_ble()) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    len = prv_build_snapshot_payload(&s_catm1_async.live_rec,
+                                     s_catm1_async.payload,
+                                     sizeof(s_catm1_async.payload));
+    if (len == 0u) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    prv_get_server(s_catm1_async.ip, &s_catm1_async.port);
+    prv_begin_sms_ready_loop_attempt();
+    s_catm1_async.sms_ready_attempt_active = true;
+    prv_catm1_set_func(prv_catm1_snapshot_start_session);
+}
+
+static void prv_catm1_snapshot_start_session(void)
+{
+    if (!prv_start_session(true)) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    s_catm1_tcp_send_session_active = true;
+    prv_catm1_set_func(prv_catm1_snapshot_prepare_tcp);
+}
+
+static void prv_catm1_snapshot_prepare_tcp(void)
+{
+    if ((!GW_App_IsTcpEnabled()) || prv_tcp_blocked_by_ble()) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    if (!prv_prepare_tcp_send_user_sequence()) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    prv_catm1_set_func(prv_catm1_snapshot_open_tcp);
+}
+
+static void prv_catm1_snapshot_open_tcp(void)
+{
+    if ((!GW_App_IsTcpEnabled()) || prv_tcp_blocked_by_ble()) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    if (!prv_open_tcp(s_catm1_async.ip, s_catm1_async.port)) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    s_catm1_async.tcp_opened = true;
+    prv_catm1_set_func(prv_catm1_snapshot_send_payload);
+}
+
+static void prv_catm1_snapshot_send_payload(void)
+{
+    if ((!GW_App_IsTcpEnabled()) || prv_tcp_blocked_by_ble()) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    if (!prv_send_tcp_payload(s_catm1_async.payload)) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    prv_receive_server_cmd_after_first_payload();
+    prv_note_failed_snapshot_sent();
+    prv_catm1_complete(true);
+}
+
+static void prv_catm1_stored_prepare(void)
+{
+    GW_FileRec_t file_rec;
+
+    if ((!GW_App_IsTcpEnabled()) || (s_catm1_async.max_count == 0u)) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    if (!GW_Storage_ReadRecordByGlobalIndex(s_catm1_async.first_rec_index, &file_rec, NULL)) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    if (prv_tcp_blocked_by_ble()) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    prv_get_server(s_catm1_async.ip, &s_catm1_async.port);
+    prv_begin_sms_ready_loop_attempt();
+    s_catm1_async.sms_ready_attempt_active = true;
+    prv_catm1_set_func(prv_catm1_stored_start_session);
+}
+
+static void prv_catm1_stored_start_session(void)
+{
+    if (!prv_start_session(true)) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    s_catm1_tcp_send_session_active = true;
+    prv_catm1_set_func(prv_catm1_stored_prepare_tcp);
+}
+
+static void prv_catm1_stored_prepare_tcp(void)
+{
+    if ((!GW_App_IsTcpEnabled()) || prv_tcp_blocked_by_ble()) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    if (!prv_prepare_tcp_send_user_sequence()) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    prv_catm1_set_func(prv_catm1_stored_open_tcp);
+}
+
+static void prv_catm1_stored_open_tcp(void)
+{
+    if ((!GW_App_IsTcpEnabled()) || prv_tcp_blocked_by_ble()) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    if (!prv_open_tcp(s_catm1_async.ip, s_catm1_async.port)) {
+        prv_catm1_complete(false);
+        return;
+    }
+
+    s_catm1_async.tcp_opened = true;
+    prv_catm1_set_func(prv_catm1_stored_send_next);
+}
+
+static void prv_catm1_stored_send_next(void)
+{
+    GW_FileRec_t file_rec;
+    GW_HourRec_t tx_rec;
+    size_t len;
+
+    if ((!GW_App_IsTcpEnabled()) || prv_tcp_blocked_by_ble()) {
+        prv_catm1_complete(s_catm1_async.sent_count > 0u);
+        return;
+    }
+
+    if (s_catm1_async.sent_count >= s_catm1_async.max_count) {
+        prv_catm1_complete(s_catm1_async.sent_count > 0u);
+        return;
+    }
+
+    if (!GW_Storage_ReadRecordByGlobalIndex(s_catm1_async.first_rec_index + s_catm1_async.sent_count,
+                                            &file_rec,
+                                            NULL)) {
+        prv_catm1_complete(s_catm1_async.sent_count > 0u);
+        return;
+    }
+
+    if (!GW_App_CopyTcpSnapshotRecord(&file_rec.rec, &tx_rec)) {
+        prv_catm1_complete(s_catm1_async.sent_count > 0u);
+        return;
+    }
+
+    len = prv_build_snapshot_payload(&tx_rec,
+                                     s_catm1_async.payload,
+                                     sizeof(s_catm1_async.payload));
+    if (len == 0u) {
+        prv_catm1_complete(s_catm1_async.sent_count > 0u);
+        return;
+    }
+
+    if (!prv_send_tcp_payload(s_catm1_async.payload)) {
+        prv_catm1_complete(s_catm1_async.sent_count > 0u);
+        return;
+    }
+
+    if (s_catm1_async.sent_count == 0u) {
+        prv_receive_server_cmd_after_first_payload();
+    }
+
+    s_catm1_async.sent_count++;
+    prv_note_failed_snapshot_sent();
+
+    if (s_catm1_async.sent_count >= s_catm1_async.max_count) {
+        prv_catm1_complete(true);
+    } else {
+        prv_catm1_set_func(prv_catm1_stored_send_next);
+    }
+}
+
+void GW_Catm1_Process(void)
+{
+    if (s_catm1_async.job_state != GW_CATM1_JOB_STATE_BUSY) {
+        return;
+    }
+
+    if (s_catm1_async.func == NULL) {
+        prv_catm1_set_func(prv_catm1_idle);
+    }
+
+    s_catm1_async.func();
+}
+
+GW_Catm1JobState_t GW_Catm1_GetJobState(void)
+{
+    return s_catm1_async.job_state;
+}
+
+GW_Catm1JobType_t GW_Catm1_GetJobType(void)
+{
+    return s_catm1_async.job_type;
+}
+
+bool GW_Catm1_TakeJobResult(GW_Catm1JobType_t* out_type,
+                            bool* out_ok,
+                            uint32_t* out_sent_count)
+{
+    if ((s_catm1_async.job_state != GW_CATM1_JOB_STATE_DONE_OK) &&
+        (s_catm1_async.job_state != GW_CATM1_JOB_STATE_DONE_FAIL)) {
+        return false;
+    }
+
+    if (out_type != NULL) {
+        *out_type = s_catm1_async.job_type;
+    }
+    if (out_ok != NULL) {
+        *out_ok = (s_catm1_async.job_state == GW_CATM1_JOB_STATE_DONE_OK);
+    }
+    if (out_sent_count != NULL) {
+        *out_sent_count = s_catm1_async.sent_count;
+    }
+
+    prv_catm1_reset_async();
+    return true;
+}
+
+bool GW_Catm1_RequestTimeSync(void)
+{
+    if (!prv_catm1_request_begin(GW_CATM1_JOB_TIME_SYNC)) {
+        return false;
+    }
+
+    s_catm1_async.attempt_max = GW_CATM1_STARTUP_SYNC_ATTEMPTS;
+    return true;
+}
+
+bool GW_Catm1_RequestSnapshot(const GW_HourRec_t* rec)
+{
     if ((!GW_App_IsTcpEnabled()) || (rec == NULL)) {
         return false;
     }
-
-    if (!GW_App_CopyTcpSnapshotRecord(rec, &live_rec)) {
+    if (!prv_catm1_request_begin(GW_CATM1_JOB_SNAPSHOT)) {
         return false;
     }
-    should_store_on_fail = true;
-
-    if ((!GW_App_IsTcpEnabled()) || prv_tcp_blocked_by_ble()) {
-        if (GW_App_IsTcpEnabled()) {
-            (void)prv_store_failed_snapshot_to_flash(&live_rec);
-        }
+    if (!GW_App_CopyTcpSnapshotRecord(rec, &s_catm1_async.live_rec)) {
+        prv_catm1_reset_async();
         return false;
     }
 
-    len = prv_build_snapshot_payload(&live_rec, payload, sizeof(payload));
-    if (len == 0u) {
-        return false;
-    }
-
-    if ((!GW_App_IsTcpEnabled()) || prv_tcp_blocked_by_ble()) {
-        if (GW_App_IsTcpEnabled()) {
-            (void)prv_store_failed_snapshot_to_flash(&live_rec);
-        }
-        return false;
-    }
-
-    prv_get_server(ip, &port);
-    UI_LPM_LockStop();
-    GW_Catm1_SetBusy(true);
-    if (!prv_lpuart_ensure()) {
-        goto cleanup;
-    }
-    prv_begin_sms_ready_loop_attempt();
-    if (!prv_start_session(true)) {
-        prv_finish_sms_ready_loop_attempt(false);
-        goto cleanup;
-    }
-    s_catm1_tcp_send_session_active = true;
-    if ((!GW_App_IsTcpEnabled()) || !prv_prepare_tcp_send_user_sequence()) {
-        goto cleanup;
-    }
-    pdp_active = true;
-    if ((!GW_App_IsTcpEnabled()) || !prv_open_tcp(ip, port)) {
-        goto cleanup;
-    }
-    opened = true;
-    if ((!GW_App_IsTcpEnabled()) || !prv_send_tcp_payload(payload)) {
-        goto cleanup;
-    }
-    prv_receive_server_cmd_after_first_payload();
-    success = true;
-    prv_note_failed_snapshot_sent();
-
-cleanup:
-    prv_consume_deferred_tcp_session_time_sync();
-    s_catm1_tcp_send_session_active = false;
-    prv_finish_sms_ready_loop_attempt(success);
-    prv_close_tcp_and_force_power_cut(opened, rsp, sizeof(rsp));
-    (void)pdp_active;
-    prv_lpuart_release();
-    GW_Catm1_SetBusy(false);
-    UI_LPM_UnlockStop();
-    if ((!success) && should_store_on_fail && GW_App_IsTcpEnabled()) {
-        (void)prv_store_failed_snapshot_to_flash(&live_rec);
-    }
-    return success;
+    s_catm1_async.live_rec_valid = true;
+    s_catm1_async.should_store_live_fail = true;
+    return true;
 }
 
-bool GW_Catm1_SendStoredRange(uint32_t first_rec_index, uint32_t max_count, uint32_t* out_sent_count)
+bool GW_Catm1_RequestStoredRange(uint32_t first_rec_index,
+                                 uint32_t max_count)
 {
-    uint8_t ip[4];
-    uint16_t port;
-    char payload[UI_CATM1_SERVER_PAYLOAD_MAX + 1u];
-    char rsp[UI_CATM1_RX_BUF_SZ];
-    GW_FileRec_t file_rec;
-    bool success = false;
-    bool pdp_active = false;
-    bool opened = false;
-    uint32_t i;
+    if ((!GW_App_IsTcpEnabled()) || (max_count == 0u)) {
+        return false;
+    }
+    if (!prv_catm1_request_begin(GW_CATM1_JOB_STORED_RANGE)) {
+        return false;
+    }
 
+    s_catm1_async.first_rec_index = first_rec_index;
+    s_catm1_async.max_count = max_count;
+    return true;
+}
+
+static bool prv_catm1_wait_for_done(uint32_t* out_sent_count)
+{
+    GW_Catm1JobType_t done_type = GW_CATM1_JOB_NONE;
+    bool ok = false;
+
+    while (GW_Catm1_GetJobState() == GW_CATM1_JOB_STATE_BUSY) {
+        GW_Catm1_Process();
+        HAL_Delay(1u);
+    }
+
+    if (!GW_Catm1_TakeJobResult(&done_type, &ok, out_sent_count)) {
+        return false;
+    }
+
+    return ok;
+}
+
+bool GW_Catm1_SyncTimeOnce(void)
+{
+    if (!GW_Catm1_RequestTimeSync()) {
+        return false;
+    }
+    return prv_catm1_wait_for_done(NULL);
+}
+
+bool GW_Catm1_QueryAndStoreLoc(char* out_line, size_t out_sz)
+{
+    if (!prv_catm1_request_query_loc(out_line, out_sz)) {
+        return false;
+    }
+    return prv_catm1_wait_for_done(NULL);
+}
+
+bool GW_Catm1_SendSnapshot(const GW_HourRec_t* rec)
+{
+    if (!GW_Catm1_RequestSnapshot(rec)) {
+        return false;
+    }
+    return prv_catm1_wait_for_done(NULL);
+}
+
+bool GW_Catm1_SendStoredRange(uint32_t first_rec_index,
+                              uint32_t max_count,
+                              uint32_t* out_sent_count)
+{
     if (out_sent_count != NULL) {
         *out_sent_count = 0u;
     }
-    if ((!GW_App_IsTcpEnabled()) || (max_count == 0u) || (out_sent_count == NULL)) {
+
+    if (!GW_Catm1_RequestStoredRange(first_rec_index, max_count)) {
         return false;
     }
-    if (!GW_Storage_ReadRecordByGlobalIndex(first_rec_index, &file_rec, NULL)) {
-        return false;
-    }
-    if (prv_tcp_blocked_by_ble()) {
-        return false;
-    }
-
-    prv_get_server(ip, &port);
-    UI_LPM_LockStop();
-    GW_Catm1_SetBusy(true);
-    if (!prv_lpuart_ensure()) {
-        goto cleanup;
-    }
-    prv_begin_sms_ready_loop_attempt();
-    if (!prv_start_session(true)) {
-        prv_finish_sms_ready_loop_attempt(false);
-        goto cleanup;
-    }
-    s_catm1_tcp_send_session_active = true;
-    if ((!GW_App_IsTcpEnabled()) || !prv_prepare_tcp_send_user_sequence()) {
-        goto cleanup;
-    }
-    pdp_active = true;
-    if ((!GW_App_IsTcpEnabled()) || !prv_open_tcp(ip, port)) {
-        goto cleanup;
-    }
-    opened = true;
-
-    for (i = 0u; i < max_count; i++) {
-        size_t len;
-        GW_HourRec_t tx_rec;
-
-        if ((!GW_App_IsTcpEnabled()) || prv_tcp_blocked_by_ble()) {
-            break;
-        }
-        if (!GW_Storage_ReadRecordByGlobalIndex(first_rec_index + i, &file_rec, NULL)) {
-            break;
-        }
-        if (!GW_App_CopyTcpSnapshotRecord(&file_rec.rec, &tx_rec)) {
-            break;
-        }
-        len = prv_build_snapshot_payload(&tx_rec, payload, sizeof(payload));
-        if (len == 0u) {
-            break;
-        }
-        if ((!GW_App_IsTcpEnabled()) || !prv_send_tcp_payload(payload)) {
-            break;
-        }
-        if ((*out_sent_count) == 0u) {
-            prv_receive_server_cmd_after_first_payload();
-        }
-        (*out_sent_count)++;
-        prv_note_failed_snapshot_sent();
-    }
-    success = ((*out_sent_count) > 0u);
-
-cleanup:
-    prv_consume_deferred_tcp_session_time_sync();
-    s_catm1_tcp_send_session_active = false;
-    prv_finish_sms_ready_loop_attempt(success);
-    prv_close_tcp_and_force_power_cut(opened, rsp, sizeof(rsp));
-    (void)pdp_active;
-    prv_lpuart_release();
-    GW_Catm1_SetBusy(false);
-    UI_LPM_UnlockStop();
-    return success;
+    return prv_catm1_wait_for_done(out_sent_count);
 }

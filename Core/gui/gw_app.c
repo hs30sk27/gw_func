@@ -168,6 +168,23 @@ static bool s_led1_sync_blink_on = false;
 static bool s_dormant_stop_mode = false;
 static bool s_boot_time_sync_beacon_pending = false;
 
+typedef enum {
+    GW_CATM1_TX_CTX_NONE = 0,
+    GW_CATM1_TX_CTX_LIVE,
+    GW_CATM1_TX_CTX_BACKLOG,
+} GW_Catm1TxCtxKind_t;
+
+typedef struct {
+    bool active;
+    GW_Catm1TxCtxKind_t kind;
+    bool rec_valid;
+    GW_HourRec_t rec;
+    uint32_t first_index;
+    uint32_t batch_count;
+} GW_Catm1TxCtx_t;
+
+static GW_Catm1TxCtx_t s_catm1_tx_ctx = {0};
+
 #define GW_BEACON_BURST_COUNT_NORMAL   (3u)
 #define GW_BEACON_BURST_COUNT_RECOVERY (5u)
 #define GW_BEACON_BURST_GAP_MS         (250u)
@@ -260,6 +277,8 @@ static bool prv_tcp_uplink_blocked_by_ble(void);
 static bool prv_have_any_tcp_uplink_candidate(void);
 static void prv_request_tcp_uplink_after_enable(bool immediate);
 static bool prv_restore_runtime_after_sync_wait_end(void);
+static void prv_clear_catm1_tx_ctx(void);
+static void prv_handle_catm1_job_result(void);
 bool GW_App_CopyTcpSnapshotRecord(const GW_HourRec_t* src, GW_HourRec_t* dst);
 static void prv_mark_periodic_beacon_slot_consumed_if_due(uint32_t epoch_sec);
 
@@ -283,7 +302,9 @@ static bool prv_handle_boot_time_sync_beacon(void)
     if (!s_boot_time_sync_beacon_pending) {
         return false;
     }
-    if ((s_state != GW_STATE_IDLE) || GW_Catm1_IsBusy()) {
+    if ((s_state != GW_STATE_IDLE) ||
+        (GW_Catm1_GetJobState() != GW_CATM1_JOB_STATE_IDLE) ||
+        GW_Catm1_IsBusy()) {
         return false;
     }
 
@@ -1215,6 +1236,84 @@ static void prv_abort_pending_tcp_uplink_state(void)
     /* 마지막 성공 uplink stamp는 유지해서 OFF->ON 전환 뒤에도
      * flash head 중복 record를 건너뛸 수 있게 둔다. */
     s_last_2m_prep_slot_id = 0xFFFFFFFFu;
+    prv_clear_catm1_tx_ctx();
+}
+
+static void prv_clear_catm1_tx_ctx(void)
+{
+    memset(&s_catm1_tx_ctx, 0, sizeof(s_catm1_tx_ctx));
+    s_catm1_tx_ctx.kind = GW_CATM1_TX_CTX_NONE;
+}
+
+static void prv_handle_catm1_job_result(void)
+{
+    GW_Catm1JobType_t job_type = GW_CATM1_JOB_NONE;
+    bool ok = false;
+    uint32_t sent_count = 0u;
+    uint32_t pending;
+
+    if (!GW_Catm1_TakeJobResult(&job_type, &ok, &sent_count)) {
+        return;
+    }
+
+    if (job_type == GW_CATM1_JOB_TIME_SYNC) {
+        s_boot_time_sync_pending = false;
+        if (!ok) {
+            prv_enter_dormant_stop_mode();
+            return;
+        }
+
+        prv_hour_rec_init(prv_get_current_cycle_timestamp_sec());
+        prv_enter_scheduled_stop_once();
+        return;
+    }
+
+    if (job_type == GW_CATM1_JOB_SNAPSHOT) {
+        if (ok && s_catm1_tx_ctx.rec_valid) {
+            prv_note_live_uplink_sent(&s_catm1_tx_ctx.rec);
+            prv_flash_tx_skip_last_live_uplink_head();
+        }
+
+        prv_flash_tx_resync_after_storage_change();
+        pending = prv_flash_tx_pending_count();
+        s_catm1_uplink_pending = (pending > 0u);
+        if (!s_catm1_uplink_pending) {
+            s_catm1_immediate_try_pending = false;
+        }
+        s_catm1_retry_not_before_ms = 0u;
+        prv_clear_catm1_tx_ctx();
+        prv_schedule_wakeup();
+        return;
+    }
+
+    if (job_type == GW_CATM1_JOB_STORED_RANGE) {
+        if (sent_count > 0u) {
+            bool included_live = false;
+
+            if (s_catm1_tx_ctx.rec_valid) {
+                included_live = prv_backlog_batch_included_live_record(s_catm1_tx_ctx.first_index,
+                                                                       sent_count,
+                                                                       &s_catm1_tx_ctx.rec);
+            }
+            prv_flash_tx_note_sent(sent_count);
+            if (included_live) {
+                prv_note_live_uplink_sent(&s_catm1_tx_ctx.rec);
+            }
+        }
+
+        prv_flash_tx_resync_after_storage_change();
+        pending = prv_flash_tx_pending_count();
+        s_catm1_uplink_pending = (pending > 0u);
+        if (!s_catm1_uplink_pending) {
+            s_catm1_immediate_try_pending = false;
+        }
+        s_catm1_retry_not_before_ms = 0u;
+        prv_clear_catm1_tx_ctx();
+        prv_schedule_wakeup();
+        return;
+    }
+
+    prv_clear_catm1_tx_ctx();
 }
 
 static void prv_reset_tcp_live_record_state(void)
@@ -1500,9 +1599,6 @@ static bool prv_run_catm1_uplink_now(void)
 {
     const GW_HourRec_t* rec;
     uint32_t pending;
-    uint32_t now_ms = HAL_GetTick();
-
-    (void)now_ms;
 
     if (!s_tcp_enabled) {
         prv_abort_pending_tcp_uplink_state();
@@ -1512,6 +1608,9 @@ static bool prv_run_catm1_uplink_now(void)
         return false;
     }
     if (s_state != GW_STATE_IDLE) {
+        return false;
+    }
+    if (GW_Catm1_GetJobState() != GW_CATM1_JOB_STATE_IDLE) {
         return false;
     }
     if (GW_Catm1_IsBusy()) {
@@ -1529,31 +1628,24 @@ static bool prv_run_catm1_uplink_now(void)
     pending = prv_flash_tx_pending_count();
 
     if (prv_should_prioritize_live_snapshot_over_backlog(rec, pending)) {
-        bool sent_ok = GW_Catm1_SendSnapshot(rec);
-
-        if (sent_ok && (rec != NULL)) {
-            prv_note_live_uplink_sent(rec);
-            prv_flash_tx_skip_last_live_uplink_head();
+        if (!GW_Catm1_RequestSnapshot(rec)) {
+            return false;
         }
 
-        prv_flash_tx_resync_after_storage_change();
-        pending = prv_flash_tx_pending_count();
-        s_catm1_uplink_pending = (pending > 0u);
-        if (s_catm1_uplink_pending) {
-            /* 실패 후에도 backlog는 유지하되, 즉시/고정지연 재시도는 하지 않는다.
-             * 다음 설정 주기(예: 5분/1시간) 또는 명시적 즉시 요청 때만 다시 보낸다. */
-            s_catm1_retry_not_before_ms = 0u;
+        prv_clear_catm1_tx_ctx();
+        s_catm1_tx_ctx.active = true;
+        s_catm1_tx_ctx.kind = GW_CATM1_TX_CTX_LIVE;
+        s_catm1_tx_ctx.rec_valid = (rec != NULL);
+        if (rec != NULL) {
+            s_catm1_tx_ctx.rec = *rec;
         }
-        prv_schedule_wakeup();
+        prv_arm_busy_state_safety_wakeup(20u);
         return true;
     }
 
     if (pending > 0u) {
         GW_FileRec_t first_rec;
-        uint32_t sent_count = 0u;
         uint32_t batch_count;
-        bool sent_ok = false;
-        bool backlog_included_live_rec = false;
 
         if ((rec != NULL) && !prv_flash_tail_matches_rec(rec)) {
             bool saved_ok = prv_save_hour_rec_verified(rec);
@@ -1568,40 +1660,31 @@ static bool prv_run_catm1_uplink_now(void)
         if ((batch_count == 0u) ||
             !GW_Storage_ReadRecordByGlobalIndex(s_flash_tx_next_send_index, &first_rec, NULL)) {
             prv_flash_tx_reset_to_tail();
-            pending = 0u;
             s_catm1_uplink_pending = false;
             s_catm1_immediate_try_pending = false;
             s_catm1_retry_not_before_ms = 0u;
             prv_schedule_wakeup();
             return true;
-        } else {
-            sent_ok = GW_Catm1_SendStoredRange(s_flash_tx_next_send_index, batch_count, &sent_count);
-            if (sent_count > 0u) {
-                backlog_included_live_rec = prv_backlog_batch_included_live_record(s_flash_tx_next_send_index, sent_count, rec);
-                prv_flash_tx_note_sent(sent_count);
-                if (backlog_included_live_rec) {
-                    prv_note_live_uplink_sent(rec);
-                }
-            }
-            prv_flash_tx_resync_after_storage_change();
-            pending = prv_flash_tx_pending_count();
-            s_catm1_uplink_pending = (pending > 0u);
-            if (s_catm1_uplink_pending) {
-                /* 실패 record부터 현재 record까지 flash backlog를 유지한다.
-                 * 재전송은 120초 고정 지연이 아니라 다음 설정 주기 때 수행한다. */
-                s_catm1_retry_not_before_ms = 0u;
-            } else {
-                s_catm1_retry_not_before_ms = 0u;
-            }
-            (void)sent_ok;
-            prv_schedule_wakeup();
-            return true;
         }
+
+        if (!GW_Catm1_RequestStoredRange(s_flash_tx_next_send_index, batch_count)) {
+            return false;
+        }
+
+        prv_clear_catm1_tx_ctx();
+        s_catm1_tx_ctx.active = true;
+        s_catm1_tx_ctx.kind = GW_CATM1_TX_CTX_BACKLOG;
+        s_catm1_tx_ctx.first_index = s_flash_tx_next_send_index;
+        s_catm1_tx_ctx.batch_count = batch_count;
+        s_catm1_tx_ctx.rec_valid = (rec != NULL);
+        if (rec != NULL) {
+            s_catm1_tx_ctx.rec = *rec;
+        }
+        prv_arm_busy_state_safety_wakeup(20u);
+        return true;
     }
 
     if (rec != NULL) {
-        bool sent_ok;
-
         if (prv_live_uplink_already_sent(rec)) {
             s_catm1_uplink_pending = false;
             s_catm1_immediate_try_pending = false;
@@ -1610,23 +1693,16 @@ static bool prv_run_catm1_uplink_now(void)
             return true;
         }
 
-        sent_ok = GW_Catm1_SendSnapshot(rec);
-        if (sent_ok) {
-            prv_note_live_uplink_sent(rec);
-            prv_flash_tx_skip_last_live_uplink_head();
+        if (!GW_Catm1_RequestSnapshot(rec)) {
+            return false;
         }
 
-        prv_flash_tx_resync_after_storage_change();
-        pending = prv_flash_tx_pending_count();
-        s_catm1_uplink_pending = (pending > 0u);
-        if (s_catm1_uplink_pending) {
-            /* snapshot 전송 실패 시 해당 record는 flash backlog에 남긴다.
-             * 재전송은 다음 설정 주기 때 실패 지점부터 현재까지 다시 보낸다. */
-            s_catm1_retry_not_before_ms = 0u;
-        } else {
-            s_catm1_retry_not_before_ms = 0u;
-        }
-        prv_schedule_wakeup();
+        prv_clear_catm1_tx_ctx();
+        s_catm1_tx_ctx.active = true;
+        s_catm1_tx_ctx.kind = GW_CATM1_TX_CTX_LIVE;
+        s_catm1_tx_ctx.rec_valid = true;
+        s_catm1_tx_ctx.rec = *rec;
+        prv_arm_busy_state_safety_wakeup(20u);
         return true;
     }
 
@@ -2066,6 +2142,12 @@ void GW_App_Process(void)
         return;
     }
 
+    GW_Catm1_Process();
+    prv_handle_catm1_job_result();
+    if (GW_Catm1_GetJobState() == GW_CATM1_JOB_STATE_BUSY) {
+        prv_arm_busy_state_safety_wakeup(20u);
+    }
+
     if (GW_Catm1_ConsumePowerFaultStopRequest()) {
         prv_enter_dormant_stop_mode();
     }
@@ -2156,15 +2238,21 @@ void GW_App_Process(void)
         return;
     }
 
-    if (s_boot_time_sync_pending && (s_state == GW_STATE_IDLE) && !GW_Catm1_IsBusy()) {
-        s_boot_time_sync_pending = false;
-        if (!GW_Catm1_SyncTimeOnce()) {
+    if (s_boot_time_sync_pending &&
+        (s_state == GW_STATE_IDLE) &&
+        (GW_Catm1_GetJobState() == GW_CATM1_JOB_STATE_IDLE) &&
+        !GW_Catm1_IsBusy()) {
+        if (!GW_Catm1_RequestTimeSync()) {
             prv_enter_dormant_stop_mode();
             return;
         }
 
-        prv_hour_rec_init(prv_get_current_cycle_timestamp_sec());
-        prv_enter_scheduled_stop_once();
+        prv_arm_busy_state_safety_wakeup(20u);
+        return;
+    }
+
+    if (s_boot_time_sync_pending &&
+        (GW_Catm1_GetJobState() == GW_CATM1_JOB_STATE_BUSY)) {
         return;
     }
 
@@ -2550,6 +2638,10 @@ static void prv_schedule_wakeup(void)
     if (s_dormant_stop_mode) {
         return;
     }
+    if (GW_Catm1_GetJobState() == GW_CATM1_JOB_STATE_BUSY) {
+        prv_arm_busy_state_safety_wakeup(20u);
+        return;
+    }
     if (s_boot_time_sync_pending) {
         return;
     }
@@ -2688,6 +2780,7 @@ void GW_App_Init(void)
     s_led1_sync_blink_on = false;
     s_dormant_stop_mode = false;
     s_boot_time_sync_beacon_pending = false;
+    prv_clear_catm1_tx_ctx();
     /* MCU 부팅 때마다 CAT-M1 one-shot 시간 확인을 수행한다.
      * 다만 boot URC(*PSUTTZ)로 시간이 이미 들어온 세션에서는 gw_catm1 쪽에서
      * +CCLK?만 짧게 확인하고 무거운 bootstrap/retry는 생략한다. */
@@ -2714,6 +2807,7 @@ void UI_Hook_OnConfigChanged(void)
     s_last_2m_prep_slot_id = 0xFFFFFFFFu;
     s_last_periodic_beacon_slot_id = 0xFFFFFFFFu;
     s_boot_time_sync_beacon_pending = false;
+    prv_clear_catm1_tx_ctx();
     prv_update_test_mode();
     prv_schedule_wakeup();
 }
@@ -2774,6 +2868,7 @@ void UI_Hook_OnTimeChanged(void)
     s_last_2m_prep_slot_id = 0xFFFFFFFFu;
     s_last_periodic_beacon_slot_id = 0xFFFFFFFFu;
     s_boot_time_sync_beacon_pending = false;
+    prv_clear_catm1_tx_ctx();
     prv_schedule_wakeup();
 }
 

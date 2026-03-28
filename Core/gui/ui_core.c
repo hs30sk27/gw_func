@@ -131,17 +131,21 @@ static void prv_cmdrx_feed(uint8_t b)
     }
 }
 
-/* -------------------------------------------------------------------------- */
-static void UI_TaskMain(void)
+typedef void (*UI_CoreFunc_t)(void);
+
+static void prv_ui_idle(void)
 {
-    /* 1) UART 명령 파싱(프레임: <CMD>CRLF only) */
-    uint8_t b = 0;
+}
+
+static void prv_ui_uart_func(void)
+{
+    uint8_t b = 0u;
+
     while (UI_UART_ReadByte(&b))
     {
         prv_cmdrx_feed(b);
     }
 
-    /* 100ms 이상 끊기면 미완성 프레임은 폐기(응답 없음) */
     if (s_cmdrx_state != CMD_RX_WAIT_START)
     {
         uint32_t now  = UTIL_TIMER_GetCurrentTime();
@@ -151,15 +155,14 @@ static void UI_TaskMain(void)
             prv_cmdrx_reset();
         }
     }
+}
 
-    /* 2) GPIO 이벤트 처리 (ISR에서 delay 금지이므로 여기서 처리) */
+static void prv_ui_key_func(void)
+{
     uint32_t ev = UI_GPIO_FetchEvents();
 
     if ((ev & UI_GPIO_EVT_TEST_KEY) != 0u)
     {
-        /* 공통: TEST_KEY = BLE ON / timeout 연장
-         * sync wait 중이면 UI_Hook_OnBleStartRequested()가 BLE resume을 처리한다.
-         */
         if (!UI_Hook_OnBleStartRequested())
         {
             UI_BLE_EnableForMs(UI_BLE_ACTIVE_MS);
@@ -168,19 +171,40 @@ static void UI_TaskMain(void)
 
     if ((ev & UI_GPIO_EVT_OP_KEY) != 0u)
     {
-        /* 공통: OP_KEY = BLE OFF */
         if (UI_BLE_IsActive())
         {
             UI_BLE_RequestStopNow();
         }
     }
+}
 
-    /* 3) BLE 이벤트 처리 (task bit이 부족한 경우 UI_MAIN에서 처리됨) */
+static void prv_ui_ble_func(void)
+{
     UI_BLE_Process();
+}
 
-    /* 4) Role(GW/ND) 이벤트 처리 (task bit이 부족한 경우 UI_MAIN에서 처리됨) */
-    /* 4) GW 이벤트 처리 */
+static void prv_ui_role_func(void)
+{
     GW_App_Process();
+}
+
+static UI_CoreFunc_t s_uart_func = prv_ui_uart_func;
+static UI_CoreFunc_t s_key_func  = prv_ui_key_func;
+static UI_CoreFunc_t s_ble_func  = prv_ui_ble_func;
+static UI_CoreFunc_t s_role_func = prv_ui_role_func;
+
+/* -------------------------------------------------------------------------- */
+static void UI_TaskMain(void)
+{
+    if (s_uart_func == NULL) { s_uart_func = prv_ui_idle; }
+    if (s_key_func  == NULL) { s_key_func  = prv_ui_idle; }
+    if (s_ble_func  == NULL) { s_ble_func  = prv_ui_idle; }
+    if (s_role_func == NULL) { s_role_func = prv_ui_idle; }
+
+    s_uart_func();
+    s_key_func();
+    s_ble_func();
+    s_role_func();
 }
 
 void UI_Core_ClearFlagsBeforeStop(void)

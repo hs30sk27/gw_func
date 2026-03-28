@@ -39,6 +39,37 @@ bool GW_Catm1_ConsumePowerFaultStopRequest(void);
 bool GW_Catm1_IsBusy(void);
 void GW_Catm1_SetBusy(bool busy);
 
+typedef enum
+{
+    GW_CATM1_JOB_NONE = 0,
+    GW_CATM1_JOB_TIME_SYNC,
+    GW_CATM1_JOB_QUERY_LOC,
+    GW_CATM1_JOB_SNAPSHOT,
+    GW_CATM1_JOB_STORED_RANGE,
+} GW_Catm1JobType_t;
+
+typedef enum
+{
+    GW_CATM1_JOB_STATE_IDLE = 0,
+    GW_CATM1_JOB_STATE_BUSY,
+    GW_CATM1_JOB_STATE_DONE_OK,
+    GW_CATM1_JOB_STATE_DONE_FAIL,
+} GW_Catm1JobState_t;
+
+/* cooperative function-pointer runner */
+void GW_Catm1_Process(void);
+GW_Catm1JobState_t GW_Catm1_GetJobState(void);
+GW_Catm1JobType_t GW_Catm1_GetJobType(void);
+bool GW_Catm1_TakeJobResult(GW_Catm1JobType_t* out_type,
+                            bool* out_ok,
+                            uint32_t* out_sent_count);
+
+/* non-blocking request API */
+bool GW_Catm1_RequestTimeSync(void);
+bool GW_Catm1_RequestSnapshot(const GW_HourRec_t* rec);
+bool GW_Catm1_RequestStoredRange(uint32_t first_rec_index,
+                                 uint32_t max_count);
+
 /* one-shot session: power on -> network time sync -> power off */
 bool GW_Catm1_SyncTimeOnce(void);
 
